@@ -21,9 +21,9 @@ A second motivation shapes several design choices: the user wants to **compare
 findings across datasets**, not just analyse one TCGA cohort. That is why
 prizes are rank-based (see below).
 
-The user works exclusively in R for omics. Do not propose porting to Python.
+The user prefers using R for omics data, but is also fluent in Python.
 
-## Design decisions already made — do not relitigate without cause
+## Design decisions already made
 
 These were argued through and settled. Each has a reason that is easy to miss.
 
