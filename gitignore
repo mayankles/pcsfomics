@@ -1,0 +1,98 @@
+# ---- project data ---------------------------------------------------------
+# Cache and generated results. Everything here is regenerable from the scripts,
+# and TCGA downloads run to several GB per project -- well past GitHub's 100 MB
+# per-file hard limit.
+.data/
+cache/
+results/
+GDCdata/
+
+# Downloaded networks and prepared objects
+omnipath*.tsv
+*.rds
+
+# Generated analysis tables
+de_table.tsv
+dmr_table.tsv
+prizes.tsv
+edge_frequency.tsv
+
+# Raw omics files, in case any land in the tree
+*.idat
+*.maf
+*.bam
+*.bai
+*.vcf
+*.vcf.gz
+*.bed
+*.bigWig
+
+# ---- R --------------------------------------------------------------------
+.Rhistory
+.Rapp.history
+.RData
+.Rproj.user/
+.Ruserdata/
+.Renviron
+.Rprofile
+
+# R CMD check / build artefacts
+*.Rcheck/
+*.tar.gz
+..Rcheck/
+
+# Compiled objects, if you ever add the PCSF backend or other compiled code
+*.o
+*.so
+*.dylib
+*.dll
+src/*.o
+src/*.so
+
+# pkgdown and vignette output
+docs/
+inst/doc/
+vignettes/*.html
+vignettes/*.pdf
+*_cache/
+*_files/
+
+# renv library (keep the lockfile -- that is the reproducibility record)
+renv/library/
+renv/local/
+renv/staging/
+!renv.lock
+
+# ---- macOS ----------------------------------------------------------------
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+.DocumentRevisions-V100
+.TemporaryItems
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+Icon?
+
+# ---- editors --------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*~
+.null-ls_*
+
+# ---- notes ----------------------------------------------------------------
+# Uncomment if your session notes should stay local:
+# NOTES.md
+# notes/
+
+# To keep a specific ignored file, negate it AFTER the rule that caught it:
+#   !results/final_subnetwork.rds
+# Note that git will not descend into an ignored DIRECTORY, so to un-ignore
+# something inside results/ you must also un-ignore the directory itself:
+#   !results/
+#   results/*
+#   !results/final_subnetwork.rds
