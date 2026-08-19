@@ -72,6 +72,46 @@ suggest_omega <- function(prizes, quantile = 0.90) {
 }
 
 
+#' Coverage of a gene set against a network, stratified by biotype
+#'
+#' The OmniPath signalling network contains only protein-coding genes, so a DEG
+#' list full of lncRNAs and pseudogenes will show low overall coverage that is
+#' expected, not a mapping bug. Splitting coverage by biotype separates the two:
+#' non-coding genes that structurally cannot map, versus protein-coding genes
+#' that should and don't (the latter is the identifier-mismatch signal worth
+#' acting on). Reported per run so drift stays visible.
+#'
+#' @param genes character vector of gene symbols (deduplicated internally)
+#' @param network_nodes character vector of node names in the network
+#' @param biotype named character vector mapping symbol -> biotype, e.g. from
+#'   \code{rowData(se)$gene_type}. Symbols absent from the map are labelled
+#'   "unknown".
+#' @return data.frame: biotype, n, in_network, coverage; sorted by n descending
+#'   with an "ALL" summary row last
+#' @export
+biotype_coverage <- function(genes, network_nodes, biotype) {
+  genes <- unique(as.character(genes))
+  if (length(genes) == 0L)
+    return(data.frame(biotype = character(0), n = integer(0),
+                      in_network = integer(0), coverage = numeric(0),
+                      stringsAsFactors = FALSE))
+  bt <- biotype[genes]; bt[is.na(bt)] <- "unknown"
+  inn <- genes %in% network_nodes
+  n   <- tapply(inn, bt, length)
+  hit <- tapply(inn, bt, sum)
+  out <- data.frame(biotype = names(n),
+                    n = as.integer(n),
+                    in_network = as.integer(hit),
+                    coverage = as.numeric(hit) / as.integer(n),
+                    row.names = NULL, stringsAsFactors = FALSE)
+  out <- out[order(-out$n), , drop = FALSE]
+  rbind(out,
+        data.frame(biotype = "ALL", n = length(genes), in_network = sum(inn),
+                   coverage = mean(inn), stringsAsFactors = FALSE),
+        make.row.names = FALSE)
+}
+
+
 #' Component size distribution of a solution
 #'
 #' Singleton components restate what the prize vector already said. Multi-node

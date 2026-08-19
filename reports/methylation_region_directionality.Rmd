@@ -1,0 +1,517 @@
+---
+title: "Promoter vs gene-body methylation"
+subtitle: "Do the two regions relate to expression with opposite sign? TCGA-THCA"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    code_folding: hide
+    fig_width: 9
+    fig_height: 5
+    df_print: kable
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      dev = "png", dpi = 140, fig.align = "center")
+suppressMessages(library(ggplot2))
+theme_set(theme_minimal(base_size = 12) +
+          theme(panel.grid.minor = element_blank(),
+                plot.title = element_text(face = "bold", size = 13),
+                plot.subtitle = element_text(colour = "grey35", size = 10.5),
+                strip.text = element_text(face = "bold")))
+COL_PROM <- "#2c7fb8"   # promoter
+COL_BODY <- "#d95f0e"   # gene body
+COL_NEG  <- "#2c7fb8"; COL_POS <- "#d7301f"; COL_NULL <- "grey80"
+RES <- ".."             # repo root, relative to reports/
+
+## region vocabularies, matching methylation_scores() in R/prizes.R
+PROM <- c("TSS1500", "TSS200", "5'UTR", "1stExon")
+BODY <- c("Body", "3'UTR", "ExonBnd")
+```
+
+# The question
+
+`pcsfomics` scores promoter and gene-body methylation **separately**, and the
+stated reason (design decision #2 in `CLAUDE.md`) is that their expected
+relationship to expression has **opposite sign**:
+
+> Promoter methylation is typically silencing; gene-body methylation is often
+> positively correlated with expression. Pooling them cancels signal.
+
+That assumption is load-bearing. It shapes `methylation_scores()`, which splits
+the two contexts, and it shapes `concordance_bonus()`, which awards full credit
+to *promoter-hyper + expression-down* and partial credit to *body-hyper +
+expression-up* as "the expected direction".
+
+The assumption comes from the literature and had never been checked against this
+cohort. This report checks it, three ways:
+
+1. **Directly** — per-gene correlation between methylation change and expression
+   change, computed separately for each region.
+2. **Through an orthogonal readout** — inferred transcription-factor activity,
+   which measures a TF's functional output from its regulon rather than from its
+   own mRNA.
+3. **Jointly** — whether the two regions carry independent information at all.
+
+The prediction, if the assumption holds, is a clean **double dissociation**:
+promoter methylation negatively related to expression and activity, body
+methylation positively related to both.
+
+---
+
+# Data and region definitions
+
+TCGA-THCA (papillary thyroid carcinoma): Illumina 450K methylation and STAR
+RNA-seq counts, tumour versus adjacent normal. The 450K annotation assigns each
+probe to one or more genes with a matching genomic context.
+
+```{r regions, fig.width=9, fig.height=2.9, fig.cap="450K region labels and how they are grouped here. The promoter group spans the transcription start site; the body group covers the transcribed length. These are the same vocabularies methylation_scores() uses."}
+par(mar = c(0.5, 0.5, 2.2, 0.5))
+plot(NA, xlim = c(-0.06, 1.02), ylim = c(-0.55, 1), axes = FALSE,
+     xlab = "", ylab = "", main = "450K probe context groups")
+## gene body bar
+rect(0.32, 0.30, 0.97, 0.52, col = adjustcolor(COL_BODY, .25), border = COL_BODY, lwd = 2)
+## promoter bar
+rect(0.02, 0.30, 0.32, 0.52, col = adjustcolor(COL_PROM, .25), border = COL_PROM, lwd = 2)
+## TSS arrow
+arrows(0.32, 0.60, 0.44, 0.60, length = 0.10, lwd = 3, col = "grey25")
+segments(0.32, 0.52, 0.32, 0.60, lwd = 3, col = "grey25")
+text(0.325, 0.72, "TSS", font = 2, cex = 0.95, col = "grey20")
+text(0.17, 0.41, "PROMOTER", font = 2, col = COL_PROM, cex = 0.95)
+text(0.645, 0.41, "GENE BODY", font = 2, col = COL_BODY, cex = 0.95)
+text(0.17, 0.12, paste(PROM, collapse = "  |  "), cex = 0.8, col = COL_PROM)
+text(0.645, 0.12, paste(BODY, collapse = "  |  "), cex = 0.8, col = COL_BODY)
+text(0.17, -0.16, "expected: methylation SILENCES", cex = 0.82, col = "grey25", font = 3)
+text(0.645, -0.16, "expected: methylation tracks EXPRESSION", cex = 0.82, col = "grey25", font = 3)
+text(0.5, -0.44, "(the second expectation is what this report tests)",
+     cex = 0.82, col = "grey45")
+```
+
+Probe-to-region assignment has one trap worth stating, because getting it wrong
+silently scrambles this entire analysis. `UCSC_RefGene_Name` and
+`UCSC_RefGene_Group` are **positionally aligned** semicolon-delimited fields:
+entry *i* of one belongs with entry *i* of the other. Splitting them
+independently mismatches genes to regions. `annotate_probes()` unpacks them
+pairwise.
+
+```{r derivation, eval=FALSE}
+## How the cached tables below were produced. Guarded by file.exists() in the
+## real scripts; shown here in full because the region split is the step that
+## has to be right.
+ann <- minfi::getAnnotation(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+gs <- strsplit(as.character(ann$UCSC_RefGene_Name),  ";", fixed = TRUE)
+rs <- strsplit(as.character(ann$UCSC_RefGene_Group), ";", fixed = TRUE)
+n  <- lengths(gs)
+keep <- n > 0 & n == lengths(rs)            # pairwise, never independently
+map <- data.frame(probe  = rep(rownames(ann)[keep], n[keep]),
+                  gene   = unlist(gs[keep], use.names = FALSE),
+                  region = unlist(rs[keep], use.names = FALSE))
+
+## differential methylation, tumour vs normal, paired on patient, tested on
+## M-values and reported as delta beta (see R/tcga_input.R)
+dm  <- diff_methylation(beta, group, patient, paired = TRUE)
+dmr <- annotate_probes(dm, anno)
+
+## one row per gene per region group: the probe with the largest |delta beta|,
+## matching how methylation_scores() aggregates (max, not sum -- summing would
+## reward CpG density rather than regulatory relevance)
+gene_level <- function(regs) {
+  d <- dmr[dmr$region %in% regs, ]
+  d <- d[order(-abs(d$delta_beta)), ]
+  d[!duplicated(d$gene), ]
+}
+promoter <- gene_level(PROM)   # -> results/promoter_methylation.tsv
+body     <- gene_level(BODY)   # -> results/body_methylation.tsv
+```
+
+```{r load-meth}
+prom <- read.delim(file.path(RES, "results/promoter_methylation.tsv"), stringsAsFactors = FALSE)
+body <- read.delim(file.path(RES, "results/body_methylation.tsv"),     stringsAsFactors = FALSE)
+
+methyl_sig_cutoff=1e-9
+sig <- function(d) sum(d$padj < methyl_sig_cutoff & abs(d$delta_beta) > 0.1, na.rm = TRUE)
+meth_data_tbl <- data.frame(
+  Region = c("Promoter", "Gene body"),
+  `Genes measured` = c(nrow(prom), nrow(body)),
+  sig = c(sig(prom), sig(body)),
+  `Median dBeta` = sprintf("%+.4f", c(median(prom$delta_beta, na.rm = TRUE),
+                                      median(body$delta_beta, na.rm = TRUE))),
+  check.names = FALSE)
+colnames(meth_data_tbl) <- c("Region","Genes measured",paste0("FDR<",methyl_sig_cutoff," & |dBeta|>0.1"),"Median dBeta")
+knitr::kable(meth_data_tbl,
+  caption = "Differential methylation by region, tumour vs normal.")
+```
+
+---
+
+# 1. The direct test: cis coupling
+
+The cleanest way to ask whether methylation tracks expression is to correlate
+them **within patients**. For each gene, take the 50 patients with both a
+tumour and a normal sample in *both* assays, and correlate the per-patient
+change in methylation against the per-patient change in expression.
+
+This paired-delta form matters. Correlating absolute levels across samples
+answers a different question — it measures between-patient variation, which in
+this cohort is dominated by 505 tumours against 50 normals. (Computed both ways,
+the absolute-level versions agree with each other at Spearman 0.971 while
+agreeing with the paired version at only 0.43.) The paired form removes
+between-patient baseline entirely, the same reason the differential expression
+design blocks on patient.
+
+```{r cis-code, eval=FALSE}
+## per gene: rank correlation of (tumour - normal) methylation against
+## (tumour - normal) expression, across the 50 patients paired in both assays
+dB <- beta_tumour[, pats] - beta_normal[, pats]     # delta beta, best probe in region
+dE <- expr_tumour[, pats] - expr_normal[, pats]     # delta logCPM
+rho <- mapply(function(i) {
+  ok <- is.finite(dB[i, ]) & is.finite(dE[i, ])
+  if (sum(ok) < 25) return(NA_real_)
+  cor(rank(dB[i, ok]), rank(dE[i, ok]))
+}, seq_len(nrow(dB)))
+```
+
+```{r cis-load}
+cp <- read.delim(file.path(RES, "results/cis_correlation_paired.tsv"), stringsAsFactors = FALSE)
+cb <- read.delim(file.path(RES, "results/cis_correlation_body.tsv"),   stringsAsFactors = FALSE)
+cis <- rbind(
+  data.frame(gene = cp$gene, rho = cp$rho_paired, padj = cp$padj, region = "Promoter"),
+  data.frame(gene = cb$gene, rho = cb$rho_body,   padj = cb$padj, region = "Gene body"))
+cis$region <- factor(cis$region, levels = c("Promoter", "Gene body"))
+
+summ <- do.call(rbind, lapply(split(cis, cis$region), function(d) data.frame(
+  Region = d$region[1],
+  Genes = nrow(d),
+  `Median rho` = sprintf("%+.3f", median(d$rho, na.rm = TRUE)),
+  `% negative` = sprintf("%.0f%%", 100 * mean(d$rho < 0, na.rm = TRUE)),
+  `Strong negative` = sum(d$rho < -0.2 & d$padj < 0.05, na.rm = TRUE),
+  `Strong positive` = sum(d$rho >  0.2 & d$padj < 0.05, na.rm = TRUE),
+  check.names = FALSE)))
+knitr::kable(summ, row.names = FALSE,
+  caption = "Cis coupling by region. If the sign assumption held, the gene-body row would be dominated by POSITIVE correlations.")
+```
+
+```{r cis-fig, fig.height=4.6, fig.cap="Per-gene cis correlation between methylation change and expression change. Both distributions sit left of zero. The gene-body distribution is shifted slightly toward zero relative to the promoter, but it is not mirrored: body methylation is predominantly NEGATIVELY coupled to expression, not positively."}
+ggplot(cis, aes(rho, fill = region)) +
+  geom_vline(xintercept = 0, colour = "grey30") +
+  geom_histogram(bins = 70, alpha = 0.55, position = "identity", colour = NA) +
+  scale_fill_manual(values = c(Promoter = COL_PROM, `Gene body` = COL_BODY), name = NULL) +
+  labs(title = "Cis coupling: methylation change vs expression change",
+       subtitle = "Paired deltas across 50 patients; negative = methylation associated with lower expression",
+       x = expression(Spearman~rho), y = "genes") +
+  theme(legend.position = "top")
+```
+
+```{r cis-paired-test}
+mm <- merge(cp[, c("gene","rho_paired")], cb[, c("gene","rho_body")], by = "gene")
+mm <- mm[is.finite(mm$rho_paired) & is.finite(mm$rho_body), ]
+w  <- wilcox.test(mm$rho_paired, mm$rho_body, paired = TRUE)
+ct <- cor.test(mm$rho_paired, mm$rho_body, method = "spearman")
+knitr::kable(data.frame(
+  Quantity = c("Genes with both regions measured",
+               "Median promoter rho", "Median body rho",
+               "Paired Wilcoxon, promoter vs body", "Correlation between the two"),
+  Value = c(nrow(mm),
+            sprintf("%+.3f", median(mm$rho_paired)),
+            sprintf("%+.3f", median(mm$rho_body)),
+            sprintf("p = %.2g", w$p.value),
+            sprintf("rho = %+.3f (p = %.2g)", ct$estimate, ct$p.value)),
+  stringsAsFactors = FALSE),
+  caption = "The regions differ significantly -- but in degree, not in sign.")
+```
+
+**Result.** Promoter median $\rho$ = `r sprintf("%+.3f", median(mm$rho_paired))`,
+body median $\rho$ = `r sprintf("%+.3f", median(mm$rho_body))`. Both negative.
+`r sprintf("%.0f%%", 100*mean(mm$rho_body < 0))` of gene bodies show negative
+coupling. The two regions do differ (paired Wilcoxon p =
+`r sprintf("%.1g", w$p.value)`) — promoter coupling is *more* negative — but
+the predicted sign flip is absent.
+
+---
+
+# 2. An orthogonal readout: transcription-factor activity
+
+Cis correlation asks whether a gene's own methylation tracks its own mRNA. A
+stronger test asks whether methylation tracks the gene's **functional output**.
+For transcription factors we can measure that independently of their own
+transcript, by scoring the coordinated behaviour of the genes they regulate.
+
+Regulons come from **DoRothEA** (confidence levels A/B, via the OmniPath web
+service). Activity is inferred with a univariate linear model — `decoupleR`'s
+`ulm` default — regressing the genome-wide differential-expression
+*t*-statistic on each TF's regulon weights. The *t*-value of the slope is the
+activity score, already variance-normalised so TFs with different regulon sizes
+are comparable.
+
+```{r tf-activity}
+dor <- read.delim(file.path(RES, "dorothea.tsv"), stringsAsFactors = FALSE)
+de  <- read.delim(file.path(RES, "results/de_table.tsv"), stringsAsFactors = FALSE)
+de  <- de[!is.na(de$t) & !duplicated(de$gene), ]
+y   <- setNames(de$t, de$gene)
+
+## OmniPath writes Python-style True/False STRINGS. Comparing them numerically
+## silently yields zero signed edges.
+tob <- function(x) x %in% c("True", "TRUE", "1", TRUE)
+st <- tob(dor$is_stimulation); ih <- tob(dor$is_inhibition)
+
+## Mode of regulation. 55% of DoRothEA edges carry neither flag; the
+## DoRothEA/decoupleR convention treats those as ACTIVATING. Both variants are
+## computed because the choice turns out to matter (see below).
+dor$mor_strict  <- ifelse(st & !ih, 1, ifelse(ih & !st, -1, 0))  # drop unsigned
+dor$mor_default <- ifelse(ih & !st, -1, 1)                       # unsigned -> +1
+dor <- dor[dor$source_genesymbol != dor$target_genesymbol &
+             dor$target_genesymbol %in% names(y), ]
+dor <- dor[!duplicated(dor[, c("source_genesymbol", "target_genesymbol")]), ]
+
+ulm <- function(morcol, min_targets = 5) {
+  d   <- dor[dor[[morcol]] != 0, ]
+  tfs <- names(which(table(d$source_genesymbol) >= min_targets))
+  do.call(rbind, lapply(tfs, function(tf) {
+    w <- setNames(rep(0, length(y)), names(y))
+    s <- d[d$source_genesymbol == tf, ]
+    w[s$target_genesymbol] <- s[[morcol]]
+    cf <- summary(lm(y ~ w))$coefficients
+    data.frame(tf = tf, n_targets = nrow(s), activity = cf["w", "t value"],
+               p = cf["w", "Pr(>|t|)"], stringsAsFactors = FALSE)
+  }))
+}
+act_strict  <- ulm("mor_strict")
+act_default <- ulm("mor_default")
+act_default$padj <- p.adjust(act_default$p, "BH")
+
+knitr::kable(data.frame(
+  Variant = c("Strict (drop unsigned edges)", "DoRothEA convention (unsigned = activating)"),
+  `Edges used` = c(sum(dor$mor_strict != 0), sum(dor$mor_default != 0)),
+  TFs = c(nrow(act_strict), nrow(act_default)),
+  `FDR<0.05` = c(sum(p.adjust(act_strict$p, "BH") < 0.05), sum(act_default$padj < 0.05)),
+  check.names = FALSE),
+  caption = "Regulon handling. Dropping unsigned edges discards more than half the resource.")
+```
+
+## The sign convention changes the answer
+
+Worth stating plainly rather than burying: **the two variants give different
+conclusions** for the promoter result. They agree broadly on the TFs themselves,
+but the strict variant is underpowered.
+
+```{r mor-sensitivity}
+tfm <- function(a) {
+  m <- merge(a, prom[, c("gene","delta_beta")], by.x = "tf", by.y = "gene")
+  ct <- cor.test(m$activity, m$delta_beta, method = "spearman")
+  sprintf("%+.3f (p = %.4g, n = %d)", ct$estimate, ct$p.value, nrow(m))
+}
+cmp <- merge(act_strict[, c("tf","activity")], act_default[, c("tf","activity")],
+             by = "tf", suffixes = c("_strict","_default"))
+knitr::kable(data.frame(
+  Quantity = c("Activity vs promoter dBeta, strict",
+               "Activity vs promoter dBeta, convention",
+               "Agreement between variants (Spearman)",
+               "Sign agreement between variants"),
+  Value = c(tfm(act_strict), tfm(act_default),
+            sprintf("%.3f", cor(cmp$activity_strict, cmp$activity_default, method = "spearman")),
+            sprintf("%.0f%%", 100*mean(sign(cmp$activity_strict) == sign(cmp$activity_default)))),
+  stringsAsFactors = FALSE),
+  caption = "The headline promoter association is significant under the standard convention and null under the strict variant. The variants are otherwise highly concordant.")
+```
+
+The convention-compliant version is used from here — it is what `decoupleR`
+does and it retains
+`r sprintf("%.0f%%", 100*sum(dor$mor_default != 0)/nrow(dor))` of the resource
+rather than
+`r sprintf("%.0f%%", 100*sum(dor$mor_strict != 0)/nrow(dor))` — but the
+dependence is a real limitation, not a footnote.
+
+## Activity against the TF's own methylation
+
+```{r tf-meth-join}
+A <- data.frame(tf = act_default$tf, n_targets = act_default$n_targets,
+                activity = act_default$activity, act_fdr = act_default$padj,
+                stringsAsFactors = FALSE)
+## Explicit column names: an earlier version of this join produced two columns
+## both called `padj_body` (activity FDR and methylation FDR), and `[[` returns
+## the first -- which silently keyed the subgroup split on the wrong one.
+P <- data.frame(tf = prom$gene, prom_dbeta = prom$delta_beta, prom_fdr = prom$padj)
+B <- data.frame(tf = body$gene, body_dbeta = body$delta_beta, body_fdr = body$padj)
+tb <- Reduce(function(x, z) merge(x, z, by = "tf", all.x = TRUE), list(A, P, B))
+stopifnot(!any(duplicated(names(tb))))
+
+reg_stat <- function(dcol) {
+  ok <- is.finite(tb$activity) & is.finite(tb[[dcol]])
+  ct <- cor.test(tb$activity[ok], tb[[dcol]][ok], method = "spearman")
+  c(rho = unname(ct$estimate), p = ct$p.value, n = sum(ok))
+}
+rs <- rbind(Promoter = reg_stat("prom_dbeta"), `Gene body` = reg_stat("body_dbeta"))
+knitr::kable(data.frame(
+  Region = rownames(rs), `TFs` = rs[, "n"],
+  `Spearman rho` = sprintf("%+.3f", rs[, "rho"]),
+  `p` = sprintf("%.4g", rs[, "p"]), check.names = FALSE), row.names = FALSE,
+  caption = "TF activity against the TF's own promoter and gene-body methylation. A sign flip would show as a positive body row.")
+```
+
+```{r tf-scatter, fig.height=4.4, fig.cap="Inferred TF activity against the TF's own methylation change. Both regions slope DOWNWARD: more methylation, lower activity. Under the design assumption the gene-body panel should slope upward."}
+lng <- rbind(
+  data.frame(tf = tb$tf, activity = tb$activity, dbeta = tb$prom_dbeta, region = "Promoter"),
+  data.frame(tf = tb$tf, activity = tb$activity, dbeta = tb$body_dbeta, region = "Gene body"))
+lng <- lng[is.finite(lng$dbeta) & is.finite(lng$activity), ]
+lng$region <- factor(lng$region, levels = c("Promoter", "Gene body"))
+ggplot(lng, aes(dbeta, activity, colour = region)) +
+  geom_hline(yintercept = 0, colour = "grey70", linetype = 2) +
+  geom_vline(xintercept = 0, colour = "grey70", linetype = 2) +
+  geom_point(alpha = 0.6, size = 1.9) +
+  geom_smooth(method = "lm", se = TRUE, linewidth = 1.1, alpha = 0.15) +
+  scale_colour_manual(values = c(Promoter = COL_PROM, `Gene body` = COL_BODY), guide = "none") +
+  facet_wrap(~ region) +
+  labs(title = "TF activity vs the TF's own methylation change",
+       subtitle = "Both slopes are negative; the predicted positive gene-body slope does not appear",
+       x = expression(delta*beta~"(tumour - normal)"), y = "inferred TF activity")
+```
+
+```{r tf-subgroups, fig.height=4.4, fig.cap="TF activity by methylation class. Promoter hypermethylation shifts activity down. Gene-body hypermethylation does not -- its median sits near the unchanged group, and the negative fraction is close to a coin flip."}
+cls <- function(db, fd) ifelse(is.finite(db) & is.finite(fd) & fd < 0.05 & abs(db) > 0.1,
+                               ifelse(db > 0, "hyper", "hypo"), "unchanged")
+box <- rbind(
+  data.frame(activity = tb$activity, class = cls(tb$prom_dbeta, tb$prom_fdr), region = "Promoter"),
+  data.frame(activity = tb$activity, class = cls(tb$body_dbeta, tb$body_fdr), region = "Gene body"))
+box <- box[is.finite(box$activity), ]
+box$region <- factor(box$region, levels = c("Promoter", "Gene body"))
+box$class  <- factor(box$class,  levels = c("hyper", "unchanged", "hypo"))
+lab <- do.call(rbind, lapply(split(box, list(box$region, box$class), drop = TRUE),
+  function(d) data.frame(region = d$region[1], class = d$class[1], n = nrow(d),
+                         med = median(d$activity))))
+ggplot(box, aes(class, activity, fill = class)) +
+  geom_hline(yintercept = 0, colour = "grey60", linetype = 2) +
+  geom_boxplot(outlier.size = 0.9, width = 0.62, alpha = 0.85) +
+  geom_text(data = lab, aes(x = class, y = -Inf, label = paste0("n=", n)),
+            inherit.aes = FALSE, vjust = -0.6, size = 3.1, colour = "grey30") +
+  ## extra room at the bottom so the n labels clear the outlier points
+  scale_y_continuous(expand = expansion(mult = c(0.12, 0.05))) +
+  scale_fill_manual(values = c(hyper = COL_POS, unchanged = COL_NULL, hypo = COL_NEG),
+                    guide = "none") +
+  facet_wrap(~ region) +
+  labs(title = "TF activity by methylation class",
+       subtitle = "Significant change = FDR < 0.05 and |delta beta| > 0.1",
+       x = NULL, y = "inferred TF activity")
+```
+
+---
+
+# 3. Do the regions carry independent information?
+
+Tumours undergo broad hypomethylation that affects gene bodies especially, so a
+gene that gains promoter methylation may gain body methylation too. If the two
+measurements are correlated, an apparent body effect could be an echo of the
+promoter effect rather than a separate phenomenon.
+
+```{r independence, fig.height=4.4, fig.cap="Promoter against gene-body methylation change, per transcription factor. The two are substantially correlated, so they cannot be treated as independent evidence."}
+d <- tb[is.finite(tb$activity) & is.finite(tb$prom_dbeta) & is.finite(tb$body_dbeta), ]
+ctpb <- cor.test(d$prom_dbeta, d$body_dbeta, method = "spearman")
+ggplot(d, aes(prom_dbeta, body_dbeta)) +
+  geom_hline(yintercept = 0, colour = "grey75", linetype = 2) +
+  geom_vline(xintercept = 0, colour = "grey75", linetype = 2) +
+  geom_point(alpha = 0.65, size = 2, colour = "grey30") +
+  geom_smooth(method = "lm", se = TRUE, colour = "#6a51a3", fill = "#6a51a3", alpha = 0.15) +
+  labs(title = "Promoter and gene-body methylation move together",
+       subtitle = sprintf("Spearman rho = %+.3f (p = %.2g, n = %d TFs)",
+                          ctpb$estimate, ctpb$p.value, nrow(d)),
+       x = expression("promoter "*delta*beta), y = expression("gene-body "*delta*beta))
+```
+
+```{r partial}
+pcor <- function(x, yy, z) {
+  rx <- resid(lm(rank(x) ~ rank(z))); ry <- resid(lm(rank(yy) ~ rank(z)))
+  ct <- cor.test(rx, ry)
+  sprintf("%+.3f (p = %.3f)", ct$estimate, ct$p.value)
+}
+m <- lm(rank(activity) ~ rank(prom_dbeta) + rank(body_dbeta), data = d)
+cf <- summary(m)$coefficients
+knitr::kable(data.frame(
+  Test = c("Activity ~ promoter (marginal)", "Activity ~ body (marginal)",
+           "Activity ~ promoter, controlling for body",
+           "Activity ~ body, controlling for promoter",
+           "Joint rank model: promoter term", "Joint rank model: body term"),
+  Result = c(sprintf("%+.3f", cor(d$activity, d$prom_dbeta, method = "spearman")),
+             sprintf("%+.3f", cor(d$activity, d$body_dbeta, method = "spearman")),
+             pcor(d$activity, d$prom_dbeta, d$body_dbeta),
+             pcor(d$activity, d$body_dbeta, d$prom_dbeta),
+             sprintf("t = %.2f (p = %.3f)", cf[2,3], cf[2,4]),
+             sprintf("t = %.2f (p = %.3f)", cf[3,3], cf[3,4])),
+  stringsAsFactors = FALSE),
+  caption = sprintf("Disentangling the two regions (n = %d TFs with both measured).", nrow(d)))
+```
+
+Controlling for promoter methylation, the gene-body association drops to
+`r pcor(d$activity, d$body_dbeta, d$prom_dbeta)` — not distinguishable from
+zero. The promoter term weakens too but survives better. With
+`r nrow(d)` TFs this is underpowered to cleanly separate two correlated
+predictors, so the honest reading is **"gene body adds nothing detectable
+here"**, not "gene body is definitively inert".
+
+---
+
+# Conclusions
+
+**The predicted sign flip does not appear in this cohort.** Every line of
+evidence points the same way:
+
+| Evidence | Promoter | Gene body | Predicted for body |
+|---|---|---|---|
+| Cis coupling, median $\rho$ | `r sprintf("%+.3f", median(mm$rho_paired))` | `r sprintf("%+.3f", median(mm$rho_body))` | **positive** |
+| Cis coupling, % negative | `r sprintf("%.0f%%", 100*mean(mm$rho_paired<0))` | `r sprintf("%.0f%%", 100*mean(mm$rho_body<0))` | **minority** |
+| vs TF activity, $\rho$ | `r sprintf("%+.3f", rs["Promoter","rho"])` | `r sprintf("%+.3f", rs["Gene body","rho"])` | **positive** |
+| Hypermethylated TFs | activity down | ~unchanged | **activity up** |
+
+Gene-body methylation behaves like a weaker version of promoter methylation, not
+like its mirror image. The two regions **do** differ significantly (paired
+Wilcoxon p = `r sprintf("%.1g", w$p.value)`), but in magnitude rather than
+direction.
+
+## What this means for the prize function
+
+Two consequences for `R/prizes.R`, of different severity:
+
+1. **`concordance_bonus()` rewards a direction that is not present.** The
+   function gives partial credit to *body-hyper + expression-up* as the expected
+   pattern. In this cohort body-hyper trends with expression **down**. That term
+   is crediting the wrong sign, so it adds noise where it intends to add
+   evidence.
+
+2. **Scoring the regions separately is still defensible, but for a different
+   reason.** The justification in `CLAUDE.md` — opposite signs, so pooling
+   cancels — does not hold here. What the data support instead is that gene-body
+   methylation is a **weaker, partly redundant** version of the promoter signal
+   (correlated at $\rho$ = `r sprintf("%+.3f", ctpb$estimate)`, and contributing
+   nothing once the promoter is accounted for). That argues for **down-weighting
+   or dropping** the body term, not for sign-flipping it.
+
+## Caveats
+
+- **One cohort, one cancer type.** THCA is genomically quiet; positive
+  body-methylation/expression coupling is better documented in highly
+  proliferative tumours. This may not generalise, and the natural next step is a
+  second TCGA cohort — which would also be the first real exercise of the
+  cross-dataset comparison the project was built for.
+- **Small TF subgroups.** Promoter hyper n = `r sum(cls(tb$prom_dbeta, tb$prom_fdr)=="hyper")`,
+  body hyper n = `r sum(cls(tb$body_dbeta, tb$body_fdr)=="hyper")`. The
+  subgroup medians are indicative, not conclusive.
+- **The regulon sign convention matters** (section 2). The promoter association
+  is significant under the standard convention and null under the strict one.
+- **CpG island context is not modelled.** `Relation_to_UCSC_CpG_Island`
+  (island / shore / shelf / open sea) is a stronger regulatory stratifier than
+  the promoter/body split alone, and island-shore methylation is the more
+  reliable signal. A region split that ignores it may be the wrong split
+  entirely — a more promising revision than adjusting the current one.
+- **Cross-reactive and SNP-overlapping probes are not excluded** (Chen 2013,
+  Zhou 2017), which inflates apparent signal at affected loci in both regions.
+
+# Reproducibility
+
+```{r session}
+cat("Inputs:  results/{promoter,body}_methylation.tsv, results/cis_correlation_{paired,body}.tsv,\n",
+    "         results/de_table.tsv, dorothea.tsv\n", sep = "")
+cat("Derived: results/tf_activity_by_region.tsv\n\n")
+cat(format(Sys.time(), "%Y-%m-%d %H:%M"), "|", R.version.string, "\n")
+```

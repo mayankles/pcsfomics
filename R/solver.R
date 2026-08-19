@@ -72,7 +72,7 @@ solve_pcsf <- function(g, prizes, omega = 3, mu = 0.005,
   }
 
   merged <- if (length(pieces) == 0L) igraph::make_empty_graph(directed = FALSE)
-            else Reduce(igraph::union, pieces)
+            else .merge_pieces(pieces)
 
   # forest split: an extra tree costs omega, so cut edges pricier than that
   if (igraph::ecount(merged) > 0L) {
@@ -99,6 +99,34 @@ solve_pcsf <- function(g, prizes, omega = 3, mu = 0.005,
     igraph::V(merged)$terminal <- nm %in% names(p)
   }
   list(subnetwork = merged, info = .summarise(merged, p, omega))
+}
+
+
+# Combine the per-component pieces into one forest graph.
+#
+# igraph::union() CANNOT be used here: when two operands carry the same edge
+# attribute (they all have `cost`), it renames them to cost_1, cost_2, ... and
+# leaves `cost` NA or absent. Downstream that silently turned every edge cost
+# into the NA->1 fallback, which wrecked both the forest-split (cost > omega
+# test) and the objective (the primary test statistic). The pieces are drawn
+# from distinct connected components of g, so they are vertex-disjoint and their
+# edges never collide -- assembling one edge list preserves costs exactly.
+.merge_pieces <- function(pieces) {
+  verts <- unique(unlist(lapply(pieces, function(p) igraph::V(p)$name)))
+  attrs <- c("cost", "is_directed", "is_stimulation", "is_inhibition")
+  edfs <- lapply(pieces, function(p) {
+    if (igraph::ecount(p) == 0L) return(NULL)
+    el <- igraph::as_edgelist(p)
+    d <- data.frame(from = el[, 1], to = el[, 2], stringsAsFactors = FALSE)
+    for (a in attrs)
+      if (!is.null(igraph::edge_attr(p, a))) d[[a]] <- igraph::edge_attr(p, a)
+    d
+  })
+  edf <- do.call(rbind, edfs)
+  vdf <- data.frame(name = verts, stringsAsFactors = FALSE)
+  if (is.null(edf))
+    edf <- data.frame(from = character(0), to = character(0), stringsAsFactors = FALSE)
+  igraph::graph_from_data_frame(edf, directed = FALSE, vertices = vdf)
 }
 
 

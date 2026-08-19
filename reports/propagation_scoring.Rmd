@@ -1,0 +1,576 @@
+---
+title: "Scoring PCSF subnetworks by signed propagation"
+subtitle: "Can a subnetwork predict the expression it claims to explain? TCGA-THCA"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    fig_width: 9
+    fig_height: 5.5
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE,
+                      dev = "png", dpi = 140, fig.align = "center")
+suppressMessages({ library(Matrix); library(igraph); library(ggplot2) })
+source("../R/propagation.R")
+source("../R/prizes.R")
+
+theme_set(theme_minimal(base_size = 12) +
+          theme(panel.grid.minor = element_blank(),
+                plot.title = element_text(face = "bold", size = 13),
+                plot.subtitle = element_text(colour = "grey35", size = 10.5),
+                strip.text = element_text(face = "bold")))
+
+## shared palette: blue = down/silenced, red = up/activated
+COL_DOWN <- "#2c7fb8"; COL_UP <- "#d7301f"; COL_NULL <- "grey80"
+COL_OK   <- "#1a9850"; COL_BAD <- "#b2182b"
+sign_pal <- function(x, lim = max(abs(x), na.rm = TRUE)) {
+  if (!is.finite(lim) || lim == 0) lim <- 1
+  f <- scales::col_numeric(c(COL_DOWN, "white", COL_UP), domain = c(-lim, lim))
+  f(pmax(pmin(x, lim), -lim))
+}
+RES <- "../results"
+have <- function(f) file.exists(file.path(RES, f))
+```
+
+# What this is
+
+`pcsfomics` builds a subnetwork with a Prize-Collecting Steiner Forest and then
+faces an awkward question: **is the recovered subnetwork any good?** The PCSF
+objective value answers "did the solver do its job", not "does this subnetwork
+describe biology". Node count rewards permissiveness. Neither is a scientific
+criterion.
+
+This report tests a different idea. OmniPath edges carry **direction and sign**
+(activation / inhibition). That makes a subnetwork a *causal hypothesis*: given
+seed genes in known states, the wiring predicts the state of everything
+downstream. Comparing that prediction against observed differential expression
+gives a goodness score grounded in mechanism.
+
+The cross-modal version is the one that matters here, and it is the project's
+founding story stated as a falsifiable prediction:
+
+> Seed with **methylation**. Score against **expression**. A gene's promoter
+> hypermethylation should silence it, and its regulon should shift accordingly.
+
+Because the two modalities never touch the same gene, the test cannot be
+satisfied by circularity.
+
+---
+
+# 1. The model
+
+$$\hat{s} \;=\; \sum_{k=1}^{K} \lambda^{k}\,\bigl(W_{\text{norm}}^{\mathsf T}\bigr)^{k}\, s_0$$
+
+$W[i,j]$ is the signed, curation-weighted influence of $i$ on $j$; $s_0$ holds
+seed states. Columns are normalised so a target's incoming influence is a
+weighted **mean** over its regulators — otherwise a gene with fifty regulators
+dominates by degree alone. Damping ($\lambda<1$, finite $K$) stops feedback
+loops ringing, which matters because regulatory graphs are dense in cycles.
+
+Two implementation points, both easy to get wrong:
+
+- The matrix must be built from the **raw interaction table**, not from
+  `load_omnipath()`. That function returns an *undirected* graph with reciprocal
+  edges collapsed — correct for PCSF, wrong here, since `A→B` and `B→A` are
+  different edges that may carry different signs.
+- OmniPath's TSV writes Python-style `True`/`False` **strings**. Comparing them
+  numerically silently yields zero directed edges. (This bit me: an early run
+  reported 0% signed edges when the true figure is 84%.)
+
+```{r network-stats}
+raw <- read.delim("../omnipath.tsv", stringsAsFactors = FALSE)
+tob <- function(x) x %in% c("True", "TRUE", "1", TRUE)
+raw <- raw[!is.na(raw$source_genesymbol) & !is.na(raw$target_genesymbol) &
+             raw$source_genesymbol != raw$target_genesymbol, ]
+sgn <- ifelse(tob(raw$is_stimulation) & !tob(raw$is_inhibition), 1,
+       ifelse(tob(raw$is_inhibition) & !tob(raw$is_stimulation), -1, 0))
+conf <- rank_normalise(ifelse(is.na(raw$curation_effort), 0, raw$curation_effort))
+W <- build_signed_matrix(raw$source_genesymbol, raw$target_genesymbol, sgn, conf)
+NODES <- rownames(W)
+
+knitr::kable(data.frame(
+  Quantity = c("Interactions in OmniPath export", "Directed", "Signed (activation or inhibition)",
+               "Usable signed edges after cleaning", "Nodes in signed graph"),
+  Value = c(format(nrow(raw), big.mark = ","),
+            sprintf("%s (%.0f%%)", format(sum(tob(raw$is_directed)), big.mark = ","),
+                    100 * mean(tob(raw$is_directed))),
+            sprintf("%s (%.0f%%)", format(sum(sgn != 0), big.mark = ","), 100 * mean(sgn != 0)),
+            format(length(W@x), big.mark = ","),
+            format(length(NODES), big.mark = ","))),
+  caption = "The signed directed substrate.")
+```
+
+---
+
+# 2. Validation on planted ground truth
+
+A negative result is uninterpretable unless the machinery provably recovers
+signal that *is* there. Three checks, all in `test_propagation.R`.
+
+## 2.1 Sign algebra
+
+The smallest possible test: inhibition must flip sign, and double inhibition
+must restore it.
+
+```{r toy-network, fig.width=8.5, fig.height=4.6, fig.cap="Sign propagation on a hand-built network. Seed A = +1 (black ring). Node fill is the propagated state: red positive, blue negative, with the value printed beneath. Blunt red connectors are inhibition, grey arrows activation."}
+Wt <- build_signed_matrix(source = c("A","B","A","D"), target = c("B","C","D","E"),
+                          sign = c(-1,-1,1,-1))
+pt <- propagate(Wt, c(A = 1), lambda = 0.5, k_hops = 4)
+st <- pt; st["A"] <- 1
+gt <- graph_from_data_frame(
+  data.frame(from = c("A","B","A","D"), to = c("B","C","D","E"), sign = c(-1,-1,1,-1)),
+  directed = TRUE, vertices = data.frame(name = names(pt)))
+## igraph rescales layouts to [-1,1] unless told otherwise. Normalising here
+## means manually drawn glyphs land in the same space as the vertices -- getting
+## this wrong silently scatters the annotations.
+lay <- norm_coords(rbind(A=c(0,0), B=c(1,0.8), C=c(2,0.8),
+                         D=c(1,-0.8), E=c(2,-0.8))[V(gt)$name, ], -1, 1, -1, 1)
+VS <- 40
+par(mar = c(0.4, 0.4, 2.2, 0.4))
+plot(gt, layout = lay, rescale = FALSE, xlim = c(-1.25,1.25), ylim = c(-1.62,1.25),
+     vertex.size = VS, vertex.color = sign_pal(st),
+     vertex.frame.color = ifelse(V(gt)$name == "A", "black", "grey50"),
+     vertex.frame.width = ifelse(V(gt)$name == "A", 3.5, 1.2),
+     vertex.label.color = "black", vertex.label.cex = 1.15, vertex.label.font = 2,
+     edge.color = NA, edge.arrow.size = 0,
+     main = "Sign propagation: inhibition flips, double inhibition restores")
+el <- as_edgelist(gt); r <- VS/200 * 1.05
+for (i in seq_len(nrow(el))) {
+  a <- lay[el[i,1], ]; b <- lay[el[i,2], ]
+  d <- (b - a)/sqrt(sum((b - a)^2)); p0 <- a + d*r; p1 <- b - d*r
+  if (E(gt)$sign[i] < 0) {
+    segments(p0[1], p0[2], p1[1], p1[2], col = COL_UP, lwd = 3.4)
+    pp <- c(-d[2], d[1]) * 0.075
+    segments(p1[1]-pp[1], p1[2]-pp[2], p1[1]+pp[1], p1[2]+pp[2], col = COL_UP, lwd = 6)
+  } else {
+    arrows(p0[1], p0[2], p1[1], p1[2], length = 0.13, angle = 22, col = "grey40", lwd = 3.4)
+  }
+}
+text(lay[,1], lay[,2] - r - 0.11, sprintf("%+.2f", st[V(gt)$name]),
+     cex = 0.95, col = "grey15", font = 2)
+legend(x = 0, y = -1.42, xjust = 0.5, horiz = TRUE, bty = "n", cex = 0.85,
+       legend = c("activation","inhibition","seed"),
+       col = c("grey40", COL_UP, "black"), lwd = c(3.4,6,3.5), seg.len = 1.4)
+```
+
+`A ⊣ B` drives B negative; `B ⊣ C` flips it back positive; `A → D ⊣ E` gives
+D positive, E negative. Sign algebra is correct.
+
+## 2.2 Planted-signal recovery, and a metric that was lying
+
+Planting a known signal in a random signed graph and adding noise exposed a
+**flaw in the original scoring metric**. Propagation reaches many genes whose
+predicted magnitude is essentially zero, and their predicted *sign* is
+arbitrary. Grading those drags accuracy toward 0.5 regardless of truth.
+
+```{r synthetic-sweep, fig.height=4.6, fig.cap="Left: at low noise, the confident tail (top 25% by |prediction|) recovers truth almost perfectly while the all-genes metric reads only 0.72. Right: predicted vs observed at three noise levels. The metric is not measuring what it appears to measure unless it is restricted to confident predictions."}
+set.seed(42)
+N <- 600; M <- 3000
+nds <- sprintf("G%03d", seq_len(N))
+Wr <- build_signed_matrix(sample(nds, M, TRUE), sample(nds, M, TRUE),
+                          sample(c(1,-1), M, TRUE, prob = c(0.8,0.2)),
+                          weight = runif(M, 0.3, 1), nodes = nds)
+sd_seeds <- setNames(sample(c(-1,1), 25, TRUE), sample(nds, 25))
+truth <- propagate(Wr, sd_seeds, lambda = 0.5, k_hops = 4)
+
+noises <- c(0.01, 0.02, 0.05, 0.1, 0.2, 0.35, 0.5, 0.75)
+sweep <- do.call(rbind, lapply(noises, function(nsd) {
+  o <- setNames(as.numeric(truth + rnorm(length(truth), 0, nsd)), names(truth))
+  s <- score_prediction(propagate(Wr, sd_seeds, lambda=0.5, k_hops=4), o,
+                        exclude = names(sd_seeds))
+  data.frame(noise = nsd, all_genes = s$sign_acc, confident_tail = s$sign_acc_conf)
+}))
+lng <- reshape(sweep, direction = "long", varying = c("all_genes","confident_tail"),
+               v.names = "acc", timevar = "metric",
+               times = c("all reached genes","confident tail (top 25%)"), idvar = "noise")
+
+layout(matrix(c(1,2,2), nrow = 1)); par(mar = c(4.2,4.2,3,1))
+plot(sweep$noise, sweep$confident_tail, type = "b", pch = 19, lwd = 2.4, col = COL_OK,
+     ylim = c(0.45, 1.02), xlab = "noise SD added to truth", ylab = "sign accuracy",
+     main = "Detection floor", cex.main = 1.05)
+lines(sweep$noise, sweep$all_genes, type = "b", pch = 17, lwd = 2.4, lty = 2, col = "grey45")
+abline(h = 0.5, lty = 3, col = "grey55")
+legend("topright", c("confident tail","all reached"), col = c(COL_OK,"grey45"),
+       lty = c(1,2), pch = c(19,17), bty = "n", cex = 0.85)
+
+par(mar = c(4.2,4.2,3,1))
+shown <- c(0.02, 0.1, 0.5)
+plot(NA, xlim = range(truth), ylim = c(-1.2,1.2)*max(abs(truth)),
+     xlab = "predicted state", ylab = "observed (truth + noise)",
+     main = "Predicted vs observed", cex.main = 1.05)
+cols <- c("#1a9850","#f1a340","#b2182b")
+for (i in seq_along(shown)) {
+  o <- truth + rnorm(length(truth), 0, shown[i])
+  points(truth, o, pch = 16, cex = 0.5, col = adjustcolor(cols[i], 0.5))
+}
+abline(0, 1, lty = 2, col = "grey30")
+legend("topleft", sprintf("noise SD = %.2f", shown), col = cols, pch = 16, bty = "n", cex = 0.85)
+```
+
+```{r synth-table}
+knitr::kable(data.frame(
+  Check = c("Sign algebra", "Planted signal (noise 0.02)", "Planted signal (noise 0.10)",
+            "Planted signal (noise 0.50)", "Negative control (pure noise)"),
+  `rho (confident)` = c("--", "0.965", "0.634", "0.201", "~0"),
+  `Sign acc (confident)` = c("--", "0.979", "0.746", "0.514", "0.505"),
+  p = c("--", "0.003", "0.003", "0.053", "0/30 below 0.05"),
+  Verdict = c("PASS","PASS","PASS","at detection floor","PASS — null calibrated"),
+  check.names = FALSE), caption = "Ground-truth validation (test_propagation.R).")
+```
+
+Two things follow, and both shape how the real results are read:
+
+1. **All later scoring uses the confident tail.** The earlier "0.52 sign
+   accuracy" figure was measured with a diluted instrument.
+2. **There is a detection floor.** At noise SD 0.5 a genuinely planted signal
+   reads 0.51 with p = 0.053 — indistinguishable from nothing. A null on real
+   data may mean "no signal" *or* "signal below this floor". These are
+   different claims and the data here cannot always separate them.
+
+---
+
+# 3. Is the seeding assumption even true?
+
+The seeds assume promoter hypermethylation silences a gene. That is the
+canonical direction, not a law. It had never been measured in this cohort
+(a known gap in `CLAUDE.md`), so it was measured three ways.
+
+```{r cis-dist, fig.height=4.6, fig.cap="Distribution of per-gene promoter-methylation vs expression correlation. Blue region: canonical silencing. Red: anti-canonical. Both absolute measures are near-symmetric with a modest canonical excess; the paired-delta measure is visibly cleaner, with a 9:1 canonical-to-anti ratio."}
+pc <- read.delim(file.path(RES, "cis_correlation_paired.tsv"), stringsAsFactors = FALSE)
+ac <- read.delim(file.path(RES, "cis_correlation_all.tsv"), stringsAsFactors = FALSE)
+
+par(mfrow = c(1,2), mar = c(4.3,4.3,3.2,1))
+hh <- function(x, main, sub) {
+  x <- x[is.finite(x)]
+  h <- hist(x, breaks = 60, plot = FALSE)
+  cols <- ifelse(h$mids < -0.2, COL_DOWN, ifelse(h$mids > 0.2, COL_UP, COL_NULL))
+  plot(h, col = cols, border = NA, main = main, cex.main = 1.05,
+       xlab = expression(rho), ylab = "genes", xlim = c(-0.8, 0.8))
+  abline(v = c(-0.2, 0.2), lty = 3, col = "grey40"); abline(v = 0, col = "grey20")
+  mtext(sub, side = 3, line = 0.15, cex = 0.75, col = "grey35")
+}
+## NB: shading marks |rho| > 0.2 only; the quoted counts additionally require
+## FDR < 0.05, so the ratio is not simply the shaded area.
+hh(ac$rho_all, "Absolute levels (tumour + normal)",
+   sprintf("median %.3f | at FDR<0.05: %d canonical vs %d anti (~4:1)",
+           median(ac$rho_all, na.rm=TRUE),
+           sum(ac$rho_all < -0.2 & ac$padj_all < 0.05, na.rm=TRUE),
+           sum(ac$rho_all > 0.2 & ac$padj_all < 0.05, na.rm=TRUE)))
+hh(pc$rho_paired, "Paired deltas (tumour - normal, per patient)",
+   sprintf("median %.3f | at FDR<0.05: %d canonical vs %d anti (~9:1)",
+           median(pc$rho_paired, na.rm=TRUE),
+           sum(pc$rho_paired < -0.2 & pc$padj < 0.05),
+           sum(pc$rho_paired > 0.2 & pc$padj < 0.05)))
+```
+
+The three measures and what they revealed:
+
+```{r cis-compare}
+mm <- merge(pc[, c("gene","rho_paired")], ac[, c("gene","rho_all","rho_tumour")], by = "gene")
+knitr::kable(data.frame(
+  Measure = c("rho_tumour (within tumours, n=505)",
+              "rho_all (tumour + normal, n=555)",
+              "rho_paired (per-patient deltas, n=50)"),
+  `Median rho` = c(sprintf("%.3f", median(ac$rho_tumour, na.rm=TRUE)),
+                   sprintf("%.3f", median(ac$rho_all, na.rm=TRUE)),
+                   sprintf("%.3f", median(pc$rho_paired, na.rm=TRUE))),
+  `Strong canonical` = c(sprintf("%d (%.0f%%)", sum(ac$rho_tumour < -0.2 & ac$padj_tumour < 0.05, na.rm=TRUE),
+                                 100*mean(ac$rho_tumour < -0.2 & ac$padj_tumour < 0.05, na.rm=TRUE)),
+                         sprintf("%d (%.0f%%)", sum(ac$rho_all < -0.2 & ac$padj_all < 0.05, na.rm=TRUE),
+                                 100*mean(ac$rho_all < -0.2 & ac$padj_all < 0.05, na.rm=TRUE)),
+                         sprintf("%d (%.0f%%)", sum(pc$rho_paired < -0.2 & pc$padj < 0.05),
+                                 100*mean(pc$rho_paired < -0.2 & pc$padj < 0.05))),
+  `Canonical : anti` = c("~4 : 1", "~4 : 1", "**9 : 1**"),
+  check.names = FALSE),
+  caption = sprintf("Agreement: rho_all vs rho_tumour = %.3f (near-identical). rho_paired vs rho_all = %.3f (a genuinely different axis).",
+                    cor(ac$rho_all, ac$rho_tumour, method="spearman", use="complete.obs"),
+                    cor(mm$rho_paired, mm$rho_all, method="spearman", use="complete.obs")))
+```
+
+**Only ~14% of genes show canonical promoter silencing.** For the large
+majority, promoter methylation and expression are effectively uncoupled. This
+retrospectively explains why an ungated additive prize diluted itself: most
+prized genes carry no working mechanism.
+
+Pooling normals with tumours changed almost nothing (Spearman **0.971** against
+tumour-only) because THCA has only 50 normals against 505 tumours. The
+**paired-delta** measure — per patient, tumour minus normal in *both* modalities
+— agrees with them at only **0.43**, and is the one that isolates the
+within-patient mechanism the seeds actually assume.
+
+```{r seed-quality, fig.height=4.3, fig.cap="Seed-set quality by cis filter. Dashed line is chance. Tightening the paired filter drives hypermethylated genes toward downregulation and hypomethylated toward upregulation, nearly quadrupling the separation. The filters select genes where the mechanism demonstrably operates."}
+sw <- readRDS(file.path(RES, "threshold_sweep.rds"))
+de <- read.delim(file.path(RES, "de_table.tsv"), stringsAsFactors = FALSE)
+de <- de[!duplicated(de$gene), ]
+m <- merge(sw$meth_s[!is.na(sw$meth_s$prom_direction), ], de[, c("gene","log2FC")], by = "gene")
+m <- merge(m, pc[, c("gene","rho_paired","p","padj")], by = "gene")
+fs <- list(
+  "all seeds" = m,
+  "paired nominal"= m[m$rho_paired < -0.1 & m$p < 0.05, ],
+  "paired loose"  = m[m$rho_paired < -0.1 & m$padj < 0.25, ],
+  "paired strict" = m[m$rho_paired < -0.2 & m$padj < 0.05, ])
+qd <- do.call(rbind, lapply(names(fs), function(k) {
+  d <- fs[[k]]; h <- d[d$prom_direction > 0, ]; o <- d[d$prom_direction < 0, ]
+  data.frame(filter = k,
+             metric = c("hyper -> down", "hypo -> up"),
+             pct = c(100*mean(h$log2FC < 0), 100*mean(o$log2FC > 0)),
+             sep = mean(o$log2FC) - mean(h$log2FC))
+}))
+qd$filter <- factor(qd$filter, levels = names(fs))
+ggplot(qd, aes(filter, pct, fill = metric)) +
+  geom_col(position = position_dodge(0.75), width = 0.68) +
+  geom_hline(yintercept = 50, linetype = 2, colour = "grey35") +
+  geom_text(aes(label = sprintf("%.0f%%", pct)), position = position_dodge(0.75),
+            vjust = -0.45, size = 3.4, fontface = "bold") +
+  geom_text(data = unique(qd[, c("filter","sep")]),
+            aes(x = filter, y = 7, label = sprintf("separation %+.2f", sep)),
+            inherit.aes = FALSE, size = 3.2, colour = "grey20", fontface = "bold") +
+  scale_fill_manual(values = c("hyper -> down" = COL_DOWN, "hypo -> up" = COL_UP), name = NULL) +
+  scale_y_continuous(limits = c(0, 105), expand = c(0,0)) +
+  labs(title = "Cis filtering selects genes where the mechanism operates",
+       subtitle = "Percent of seeds moving in the canonical direction; dashed line = chance",
+       x = NULL, y = "% in canonical direction") +
+  theme(legend.position = "top")
+```
+
+---
+
+# 4. Results on real data
+
+```{r real-setup}
+ms <- sw$meth_s[!is.na(sw$meth_s$prom_direction) & !is.na(sw$meth_s$prom_score), ]
+seed_all <- setNames(-ms$prom_direction * ms$prom_score, ms$gene)
+seed_all <- seed_all[names(seed_all) %in% NODES]
+paired_loose <- seed_all[names(seed_all) %in%
+                           pc$gene[pc$rho_paired < -0.1 & pc$padj < 0.25]]
+deg <- de[!is.na(de$t) & de$gene %in% NODES, ]
+obs_t <- setNames(deg$t, deg$gene)
+obs_sig <- setNames(deg$padj < 0.05, deg$gene)
+v4 <- read.delim(file.path(RES, "simulation_goodness_v4.tsv"), stringsAsFactors = FALSE)
+```
+
+## 4.1 The prediction, drawn on the real network
+
+The figure below is the whole idea in one picture: methylation seeds on the
+left, their predicted downstream consequences propagated through signed
+OmniPath edges, and the observed expression change drawn beside each prediction.
+
+```{r overlay, fig.width=12, fig.height=4.4, fig.cap="Three methylation seeds and their direct regulatory targets. Centre square is the seed; its methylation state sets the sign. Grey arrows are activation, red blunt connectors inhibition, so the PREDICTED target state is the seed state times the edge sign. Circle fill shows the OBSERVED differential expression (red up, blue down). Green ring = prediction and observation agree, red ring = they disagree. IRS1 is the canonical case: promoter hypermethylation, presumed silenced."}
+pred_full <- propagate(W, paired_loose, lambda = 0.5, k_hops = 1)
+
+info <- lapply(names(paired_loose), function(s) {
+  tg <- NODES[which(W[s, ] != 0)]
+  tg <- setdiff(intersect(tg, names(obs_t)), names(paired_loose))
+  tg <- tg[obs_sig[tg] %in% TRUE]
+  if (length(tg) < 5) NULL else list(seed = s, targets = tg, n = length(tg))
+})
+info <- Filter(Negate(is.null), info)
+info <- info[order(-vapply(info, function(x) x$n, 0))]
+hyp <- vapply(info, function(x) paired_loose[[x$seed]] < 0, TRUE)
+pick <- Filter(Negate(is.null), c(head(info[hyp], 1), head(info[!hyp], 2))[1:3])
+
+star_panel <- function(p, maxt = 14) {
+  s <- p$seed
+  tg <- p$targets[order(-abs(obs_t[p$targets]))][1:min(maxt, p$n)]
+  esign <- sign(as.numeric(W[s, tg]))
+  ok <- sign(paired_loose[[s]] * esign) == sign(obs_t[tg])
+  n <- length(tg); ang <- seq(0, 2*pi, length.out = n + 1)[1:n] + pi/2
+  lay <- rbind(c(0,0), cbind(cos(ang), sin(ang)) * 0.72)
+  g <- graph_from_data_frame(data.frame(from = rep(s, n), to = tg),
+                             directed = TRUE, vertices = data.frame(name = c(s, tg)))
+  plot(g, layout = lay, rescale = FALSE, xlim = c(-1.5,1.5), ylim = c(-1.35,1.35),
+       vertex.size = c(24, rep(16, n)),
+       vertex.color = c("grey35", sign_pal(as.numeric(obs_t[tg]),
+                                           lim = max(abs(obs_t), na.rm = TRUE))),
+       vertex.shape = c("square", rep("circle", n)),
+       vertex.frame.color = c("black", ifelse(ok, COL_OK, COL_BAD)),
+       vertex.frame.width = 3,
+       vertex.label = c(s, tg), vertex.label.cex = c(0.85, rep(0.62, n)),
+       vertex.label.color = c("white", rep("grey10", n)),
+       vertex.label.dist = c(0, rep(2.6, n)), vertex.label.degree = c(0, ang),
+       vertex.label.font = c(2, rep(1, n)),
+       edge.color = ifelse(esign < 0, adjustcolor(COL_UP,.8), adjustcolor("grey45",.8)),
+       edge.width = 2.2, edge.arrow.size = 0.35,
+       main = sprintf("%s (%s) — %d/%d agree", s,
+                      ifelse(paired_loose[[s]] < 0, "hyper: silenced", "hypo: activated"),
+                      sum(ok), n))
+}
+par(mfrow = c(1, length(pick)), mar = c(0.4, 0.9, 2.6, 0.9))
+invisible(lapply(pick, star_panel))
+```
+
+Individual stars show the effect is real but noisy — agreement runs roughly
+6/13 to 10/14 across seeds. The quantitative version over every reached gene:
+
+```{r scatter, fig.width=9, fig.height=4.6, fig.cap="Every significantly-changed gene reached by propagation from paired cis-validated seeds. Coloured points are the confident tail (beyond the dotted thresholds): green where predicted and observed signs agree, red where they do not. Grey points fall below the confidence threshold, where the predicted sign is not meaningful. The positive trend is visible and is the strongest result in the study — and equally visibly, it is a weak trend."}
+cand <- pred_full[abs(pred_full) > 1e-9 & names(pred_full) %in% names(obs_t)]
+cand <- cand[!names(cand) %in% names(paired_loose)]
+sigc <- cand[obs_sig[names(cand)] %in% TRUE]
+o <- obs_t[names(sigc)]
+thr <- quantile(abs(sigc), 0.75); isc <- abs(sigc) >= thr
+par(mar = c(4.3, 4.4, 3, 1))
+plot(sigc, o, pch = 16, cex = 0.75,
+     col = ifelse(isc, ifelse(sign(sigc) == sign(o), adjustcolor(COL_OK,.85),
+                              adjustcolor(COL_BAD,.85)), adjustcolor("grey70",.5)),
+     xlab = "predicted state (signed propagation from methylation seeds)",
+     ylab = "observed DE t-statistic",
+     main = "Prediction vs observation, full network, k = 1")
+abline(h = 0, v = 0, col = "grey65", lty = 2)
+abline(v = c(-thr, thr), col = "grey40", lty = 3)
+legend("topleft", bty = "n", cex = 0.85,
+       legend = c(sprintf("confident tail: rho = %+.3f",
+                          cor(sigc[isc], o[isc], method = "spearman")),
+                  sprintf("sign agreement = %.0f%%",
+                          100*mean(sign(sigc[isc]) == sign(o[isc]))),
+                  sprintf("n = %d reached, %d confident", length(sigc), sum(isc))),
+       text.col = c("grey10","grey10","grey45"))
+```
+
+## 4.2 The substrate matters more than the seeds
+
+The headline result, and it was not what was expected:
+
+```{r results-bar, fig.height=5, fig.cap="Prediction quality by seed set and evaluation network (k=1). With unfiltered seeds the PCSF subnetworks beat the full network. With cis-validated paired seeds the pattern INVERTS decisively: the full network wins. Stars mark uncorrected p < 0.05; none survive FDR correction."}
+d <- v4[v4$k_hops == 1, ]
+d$network <- factor(d$network, levels = c("LFC1.0","LFC1.5","LFC2.0","full_network"),
+                    labels = c("PCSF LFC1.0","PCSF LFC1.5","PCSF LFC2.0","FULL network"))
+d$seeds <- factor(d$seeds, levels = c("assumed","abs_strict","paired_nom","paired_loose","paired_strict"),
+                  labels = c("assumed\n(unfiltered)","absolute cis\nstrict","paired\nnominal",
+                             "paired\nloose","paired\nstrict"))
+ggplot(d, aes(seeds, rho_conf, fill = network)) +
+  geom_hline(yintercept = 0, colour = "grey40") +
+  geom_col(position = position_dodge(0.8), width = 0.72) +
+  geom_text(aes(label = ifelse(p_emp < 0.05, "*", "")),
+            position = position_dodge(0.8), vjust = -0.15, size = 6, colour = "grey15") +
+  scale_fill_manual(values = c("PCSF LFC1.0"="#a6bddb","PCSF LFC1.5"="#74a9cf",
+                               "PCSF LFC2.0"="#3690c0","FULL network"="#e6550d"), name = NULL) +
+  labs(title = "Where the signal lives depends on the seed set",
+       subtitle = expression("Spearman "*rho*" between predicted state and observed DE, confident tail, k = 1"),
+       x = NULL, y = expression(rho[confident])) +
+  theme(legend.position = "top")
+```
+
+With **unfiltered** seeds, the PCSF subnetworks beat the full network 3/3
+(best $\rho$ = 0.189, sign accuracy 0.606, p = 0.010). With **paired
+cis-validated** seeds the ordering flips: the full network gives the strongest
+result in the entire study ($\rho$ = **0.281**, p = **0.0033**) while the
+subnetworks fall to $\rho \approx 0.14$.
+
+The explanation is structural, and it invalidates the original experiment
+rather than the idea:
+
+> **PCSF built those subnetworks from expression-driven prizes.** They are
+> organised around differentially expressed genes, not around methylation
+> seeds. The seeds' real downstream targets largely lie *outside* them, so
+> restricting evaluation to the subnetwork discards precisely the edges the
+> hypothesis needs.
+
+Testing a methylation-seeded hypothesis on an expression-derived subnetwork was
+the wrong experiment. That is a design error, not a biological finding.
+
+## 4.3 A ceiling: the positive control barely works
+
+The decisive diagnostic. Seed with the strongest DE genes and predict *other*
+genes' expression — same assay, same contrast, same samples, no cross-modal gap
+and no methylation assumption. This is the most favourable test the network can
+be given.
+
+```{r posctl, fig.height=4.4, fig.cap="Expression-seeded positive control. Even under ideal conditions the signed propagation model peaks near rho = 0.27 and degrades as seeds are added; almost nothing clears its own degree-matched null. This caps what any amount of seed refinement can achieve."}
+p1 <- read.delim(file.path(RES, "positive_control.tsv"), stringsAsFactors = FALSE)
+p1 <- p1[p1$k_hops == 1, ]
+p1$network <- factor(p1$network, levels = c("LFC1.0","LFC1.5","LFC2.0","full_network"))
+ggplot(p1, aes(factor(n_seed), rho_conf, group = network, colour = network)) +
+  geom_hline(yintercept = 0, colour = "grey60") +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 3.4) +
+  scale_colour_manual(values = c("LFC1.0"="#a6bddb","LFC1.5"="#74a9cf",
+                                 "LFC2.0"="#3690c0","full_network"="#e6550d"), name = NULL) +
+  labs(title = "Positive control: expression predicting expression",
+       subtitle = sprintf("Most favourable possible test of the signed network. Peaks near %.2f, then decays. No point here reaches p < 0.05.",
+                          max(p1$rho_conf)),
+       x = "number of DE genes used as seeds", y = expression(rho[confident]))
+```
+
+Best case $\rho$ = 0.269 (sign accuracy 0.633) at 100 seeds, **p = 0.124** — it
+does not cleanly beat its own null, and it *decays* toward 0.12 as seeds
+increase. Damped linear propagation over OmniPath simply has limited resolution
+on this bulk expression field, whatever the seeds are. The modest methylation
+results are therefore not primarily a seeding failure.
+
+---
+
+# 5. Statistical honesty
+
+```{r fdr}
+knitr::kable(data.frame(
+  Quantity = c("Configurations tested (final grid)", "Best uncorrected p",
+               "Minimum FDR (Benjamini-Hochberg)", "Results surviving FDR < 0.05"),
+  Value = c(nrow(v4), sprintf("%.4f", min(v4$p_emp)),
+            sprintf("%.3f", min(p.adjust(v4$p_emp, "BH"))),
+            sum(p.adjust(v4$p_emp, "BH") < 0.05)),
+  stringsAsFactors = FALSE),
+  caption = "Nothing in this report survives multiple-testing correction.")
+```
+
+Every effect described here is **suggestive, not established**. Additional
+caveats worth carrying forward:
+
+- **~26% of subnetwork edges are unsigned** and were dropped from propagation.
+- Correlation-based scoring across genes is not independent — network
+  neighbours share regulators, so effective sample size is below the gene count.
+- The paired-delta measure rests on **50 patients**; it is specific but
+  underpowered, and its filters are therefore conservative.
+- The positive control shares an assay between seeds and targets, so it is a
+  capability check on the network model, **not** independent biological
+  evidence.
+
+---
+
+# 6. Conclusions
+
+**What was established.**
+
+1. The propagation machinery is **validated** against planted ground truth, with
+   a calibrated null and a known detection floor.
+2. The canonical methylation-silencing assumption holds for only about **14%**
+   of genes — measured, not assumed, closing a known gap.
+3. The **paired-delta** cis measure is a genuinely different and cleaner axis
+   (9:1 canonical:anti) than absolute-level correlation, and is the correct way
+   to ask this question when paired samples exist.
+4. **Two hypotheses were tested and refuted**: that tumour-only correlation was
+   the wrong axis (pooling changed nothing — 0.971 agreement), and that better
+   cis seeds would sharpen the prediction (they did not, on PCSF subnetworks).
+
+**What was not.** No configuration survives multiple-testing correction. The
+best result — paired seeds on the full network, $\rho$ = 0.281, p = 0.0033 — is
+promising and unproven.
+
+**The load-bearing conclusion.** Two limits were hit, and they are different in
+kind. One is a **design error**: scoring a methylation-seeded hypothesis on an
+expression-derived subnetwork removes the relevant edges, and is fixable. The
+other is a **capability limit**: the positive control shows damped linear
+propagation cannot predict this expression field well even under ideal
+conditions, and no seed curation will fix that.
+
+**Two directions worth more than further seed tuning:**
+
+1. **Match the subnetwork to the hypothesis.** Run PCSF seeded *from the
+   methylation genes toward observed responders*, so the recovered subnetwork
+   and the tested hypothesis concern the same edges.
+2. **Replace linear propagation with sign-consistency optimisation.**
+   [CARNIVAL](https://saezlab.github.io/CARNIVAL/) (Saez-Rodriguez lab, same
+   group as OmniPath) solves exactly this problem as an ILP over signed
+   OmniPath, optimising *consistency* rather than diffusing magnitude. The
+   positive control suggests this is the more promising axis of the two.
+
+```{r sessioninfo, echo=FALSE}
+cat("Generated:", format(Sys.time(), "%Y-%m-%d %H:%M"), "|",
+    R.version.string, "| igraph", as.character(packageVersion("igraph")),
+    "| Matrix", as.character(packageVersion("Matrix")), "\n")
+```
